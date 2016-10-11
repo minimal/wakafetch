@@ -1,14 +1,23 @@
 {-# LANGUAGE OverloadedStrings #-}
-
+{-# LANGUAGE FlexibleContexts #-}
+-- {-# LANGUAGE NoImplicitPrelude #-}
+-- https://github.com/sdiehl/protolude
+-- import Protolude
 
 module Lib
-    ( someFunc, date, stuff, getLastBeeminderDate, getSafeWaka
+    ( someFunc, date, stuff, getLastBeeminderDate, getSafeWaka, getData, runMainT
     ) where
+
 import qualified Control.Exception    as E
 import           Control.Lens
+import           Control.Monad.Except
+import           Control.Monad.Trans  (MonadIO (..))
 import           Data.Aeson
 import           Data.Aeson.Lens      (key, nth, _Number, _String)
+import           Data.Bool            (bool)
 import           Data.ByteString      (ByteString)
+import qualified Data.ByteString.Lazy as LBS
+import           Data.Monoid          ((<>))
 import qualified Data.Scientific      as Scientific
 import           Data.Text            (Text)
 import qualified Data.Text            as T
@@ -17,20 +26,26 @@ import qualified Data.Time.Clock      as Clock
 import           Data.Time.Format     (defaultTimeLocale, formatTime,
                                        iso8601DateFormat)
 import           Data.Time.LocalTime
--- import           Formatting          (int, sformat, (%))
--- import qualified Formatting.Time     as Ft (dayOfMonth, month, year)
-import qualified Data.ByteString.Lazy as LBS
 import           GHC.Generics
 import           Network.HTTP.Client  (HttpException (StatusCodeException),
                                        Response)
-import           Network.Wreq
+import           Network.Wreq         (FormParam ((:=)))
+import qualified Network.Wreq         as Wr
 import           System.Environment   (getArgs)
 import           Text.Printf          (printf)
 
-iso8601 :: Clock.UTCTime -> String
-iso8601 = formatTime defaultTimeLocale "%F"
+-- import    Data.Either.Combinators
+--import Data.Either.Utils (maybeToEither)
+-- import           Formatting          (int, sformat, (%))
+-- import qualified Formatting.Time     as Ft (dayOfMonth, month, year)
 
-extractSeconds r = r ^? responseBody
+newtype Token = Token ByteString
+
+-- iso8601 :: Clock.UTCTime -> String
+-- iso8601 = formatTime defaultTimeLocale "%F"
+
+extractSeconds :: Response LBS.ByteString -> Maybe Scientific.Scientific
+extractSeconds r = r ^? Wr.responseBody
                  . key "data"
                  . nth 0
                  . key "grand_total"
@@ -44,27 +59,101 @@ getSafeWaka :: Token
             -> String
             -> IO (Either ByteString (Response LBS.ByteString))
 getSafeWaka (Token token) date =
-    (Right <$> getWith opts (summariesURL ++ date ++ "&end=" ++ date)) `E.catch`
+    (Right <$> Wr.getWith opts (summariesURL <> date <> "&end=" <> date)) `E.catch`
         handler
   where
-    opts = defaults & auth ?~ basicAuth "" token
-    handler (StatusCodeException s _ _) = return $ Left (s ^. statusMessage)
+    opts = Wr.defaults & Wr.auth ?~ Wr.basicAuth "" token
+    handler (StatusCodeException s _ _) = return $ Left (s ^. Wr.statusMessage)
 
 
+data MyError
+    = StatusError Int
+    | KeyError Text
+    | NoChange Text
+    deriving (Show)
 
-x = 2
-summariesURL = "https://wakatime.com/api/v1ds/users/current/summaries?start="
+-- guardedAction :: (MonadIO m, MonadError String m) => IO a -> m a
+-- guardedAction action = do
+--  result <- liftIO $ E.tryIOError action
+--  case result of
+--    Left  e -> throwError (show e)
+--    Right r -> return r
 
-data Token = Token ByteString
+
+handleResp r =
+    case r ^. Wr.responseStatus . Wr.statusCode of
+        200 -> return r
+        x -> throwError $ StatusError x
+
+getData
+    :: (MonadError MyError m, MonadIO m)
+    => Token -> String -> m (Response LBS.ByteString)
+getData (Token token) date = do
+    let url = summariesURL <> date <> "&end=" <> date
+        opts = defOpts & Wr.auth ?~ Wr.basicAuth "" token
+    r <- liftIO $ Wr.getWith opts url
+    handleResp r
+
+defOpts :: Wr.Options
+defOpts =
+    Wr.defaults & Wr.checkStatus ?~
+    \_ _ _ ->
+         Nothing
+
+getLastBeeminderDateSafe :: (MonadError MyError m, MonadIO m) => m Text
+getLastBeeminderDateSafe = do
+    r <- liftIO $ Wr.getWith defOpts beeminderUrl
+    r <- handleResp r
+    maybeToError
+        (KeyError "Key not found")
+        (r ^? Wr.responseBody . nth 0 . key "daystamp" . _String)
+
+postBeeminderSafe :: (MonadError MyError m, MonadIO m) => Float -> Text -> m Int
+postBeeminderSafe hours daystamp = do
+    r <-
+        liftIO $
+        Wr.postWith
+            defOpts
+            beeminderUrl
+            ["daystamp" := (daystamp :: Text), "value" := (hours :: Float)]
+    r <- handleResp r
+    return (r ^. Wr.responseStatus . Wr.statusCode)
+
+runMainT :: IO ()
+runMainT = do
+    let token = atoken
+    r <-
+        runExceptT $
+        do today <- liftIO date
+           res <- getData token (show (yesterday today))
+           hours <-
+               maybeToError (KeyError "key fail") $
+               secondsToHours <$> extractSeconds res
+           lastDate <- getLastBeeminderDateSafe
+           let yest = yesterday today
+               yestDayStamp =
+                   T.pack $ formatTime defaultTimeLocale "%Y%m%d" yest
+           if yestDayStamp == lastDate
+               then throwError $ NoChange "Dates same"
+               else postBeeminderSafe
+                        (Scientific.toRealFloat hours)
+                        yestDayStamp
+    print r
+
+
+summariesURL = "https://wakatime.com/api/v1/users/current/summaries?start="
+
+-- TODO: look at https://hackage.haskell.org/package/errors-2.1.2/docs/Control-Error-Util.html
+
 
 -- TODO: make return either
 getWakaSeconds :: Token
      -> String -> IO (Maybe Scientific.Scientific)
 getWakaSeconds token date = do
-    r2 <- (getSafeWaka token date)
+    r2 <- getSafeWaka token date
     case r2 of
-      Right _ -> return ()
-      Left msg -> print msg
+        Right _ -> return ()
+        Left msg -> print msg
     let res =
             case r2 of
                 (Right a) -> extractSeconds a
@@ -74,16 +163,16 @@ getWakaSeconds token date = do
 beeminderUrl = "https://www.beeminder.com/api/v1/users/minimal/goals/wakatime/datapoints.json?auth_token="
 
 getLastBeeminderDate = do
-    r <- get beeminderUrl
-    return (r ^? responseBody . nth 0 . key "daystamp" . _String)
+    r <- Wr.get beeminderUrl
+    return (r ^? Wr.responseBody . nth 0 . key "daystamp" . _String)
 
 
 postBeeminder hours daystamp = do
     r <-
-        post
+        Wr.post
             beeminderUrl
             ["daystamp" := (daystamp :: Text), "value" := (hours :: Float)]
-    return (r ^. responseStatus . statusCode)
+    return (r ^. Wr.responseStatus . Wr.statusCode)
 
 
 
@@ -107,10 +196,39 @@ yesterday today =
 -- {username: "",
 -- auth_token: ""}
 
+atoken = Token ""
+
+-- maybeToEither = flip maybe Right . Left
+maybeToEither :: a -> Maybe b -> Either a b
+maybeToEither leftValue = maybe (Left leftValue) Right
+
+maybeToError :: (MonadError a m) => a -> Maybe b -> m b
+maybeToError leftValue = maybe (throwError leftValue) return
+
+liftEither :: (Monad m, MonadError a (Either a)) => Either a b -> ExceptT a m b
+liftEither = either throwError return
+
+yesterdayHours :: IO (Either ByteString Scientific.Scientific)
+yesterdayHours = do
+    today <- date
+    res <- getSafeWaka atoken $ show (yesterday today)
+    return $
+        do r <- res
+           seconds <- maybeToEither "key not found" $ extractSeconds r
+           return $ secondsToHours seconds
+
+shouldPost lastBeeminderDate today = do
+  beedate <- lastBeeminderDate
+  let yest = yesterday today
+      yestDayStamp = T.pack $ formatTime defaultTimeLocale "%Y%m%d" yest
+      in if beedate /= yestDayStamp
+            then Just yestDayStamp
+            else Nothing
+
 someFunc :: IO ()
 someFunc = do
     -- [prefixarg] <- getArgs
-    let token = Token ""
+    let token = atoken
     today <- date
     seconds <- getWakaSeconds token $ show (yesterday today)
     now <- Clock.getCurrentTime
@@ -174,3 +292,6 @@ stuff = do
     print 5
     --let yesterday = Cal.addDays (-1) (Cal.fromGregorian year month day)
     --print $ iso8601 (Clock.utctDay yesterday)
+
+brexit :: a
+brexit = brexit

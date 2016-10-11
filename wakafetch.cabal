@@ -28,6 +28,7 @@ library
                      , bytestring
                      , formatting
                      , http-client
+                     , mtl
   default-language:    Haskell2010
 
 executable wakafetch-exe
